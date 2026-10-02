@@ -347,6 +347,38 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 13px; }
 .stat-tile .v { font-size: 22px; font-weight: 700; font-family: var(--mono); }
 .stat-tile .k { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
 
+/* ---------- 执行轨迹回放 ---------- */
+.trace-wrap { display: grid; grid-template-columns: minmax(360px, 5fr) 6fr; gap: 16px; align-items: start; }
+@media (max-width: 1000px) { .trace-wrap { grid-template-columns: 1fr; } }
+.trace-list { border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.trace-row {
+  display: grid; grid-template-columns: 56px 22px 1fr auto; gap: 8px; align-items: center;
+  padding: 5px 10px; cursor: pointer; border-bottom: 1px solid var(--border);
+  font-size: 12.5px; background: var(--surface);
+}
+.trace-row:hover { background: var(--surface-2); }
+.trace-row.sel { background: var(--primary-soft); box-shadow: inset 3px 0 0 var(--primary); }
+.trace-row .seq { color: var(--text-faint); font-family: var(--mono); font-size: 11px; text-align: right; }
+.trace-row .ind { color: var(--text-faint); font-family: var(--mono); font-size: 10px; text-align: right; }
+.trace-row .main { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trace-row .ln { color: var(--text-faint); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+.trace-row.k-line .ico { color: var(--text-muted); }
+.trace-row.k-call .ico { color: var(--success); }
+.trace-row.k-return .ico { color: var(--info); }
+.trace-row.k-builtin .ico { color: var(--accent); }
+.trace-row.k-start .ico { color: var(--primary); }
+.trace-row.k-error { background: var(--danger-soft); }
+.trace-row.k-error .ico { color: var(--danger); }
+.trace-row .fn { font-family: var(--mono); font-weight: 600; }
+.trace-page { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--surface-2); font-size: 12px; }
+.trace-code { font-family: var(--mono); font-size: 12.5px; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: auto; max-height: 300px; }
+.trace-code .cl { display: flex; white-space: pre; padding: 0 10px; line-height: 20px; min-height: 20px; }
+.trace-code .cl .no { width: 38px; flex: 0 0 38px; color: var(--text-faint); text-align: right; margin-right: 12px; user-select: none; }
+.trace-code .cl.cur { background: var(--primary-soft); box-shadow: inset 3px 0 0 var(--primary); }
+.trace-code .cl.cur .no { color: var(--primary); font-weight: 700; }
+.trace-detail { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.pager button { min-width: 64px; }
+
 /* ---------- 内存模型 ---------- */
 .mem-stack .frame { border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 8px; overflow: hidden; }
 .mem-stack .frame .fn { background: var(--surface-2); padding: 5px 10px; font-family: var(--mono); font-size: 12px; font-weight: 600; }

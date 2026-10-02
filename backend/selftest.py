@@ -34,13 +34,15 @@ def _run(source, **opts):
 
 
 _SVC_RUN = None
+_SVC = None
 
 
 def run_all():
-    global _SVC_RUN
+    global _SVC_RUN, _SVC
     from . import service
     svc = service.Service()
     _SVC_RUN = svc.run
+    _SVC = svc
 
     _test_lexer()
     _test_parser()
@@ -51,6 +53,7 @@ def run_all():
     _test_lists()
     _test_runtime_errors()
     _test_debugger()
+    _test_tracer()
     _test_profiler()
     _test_memory_model()
     _test_storage()
@@ -180,6 +183,55 @@ def _test_debugger():
     snap3 = dbg.snapshot()
     ok_finish = snap3["finished"] is True and vm.output == ["3"]
     _check("调试器：继续运行到程序结束", ok_finish, str(vm.output))
+
+
+def _test_tracer():
+    src = ("func fib(n) {\n"
+           "    if (n < 2) { return n; }\n"
+           "    return fib(n - 1) + fib(n - 2);\n"
+           "}\n"
+           "print(fib(5));")
+    data = _SVC.trace_run(src)
+    ok = data.get("ok") and data["output"] == ["5"] and data["total"] > 10
+    kinds = {}
+    for e in data["events"]:
+        kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+    ok = ok and kinds.get("call", 0) == 15 and kinds.get("return", 0) == 16
+    ok = ok and kinds.get("builtin", 0) == 1 and kinds.get("start", 0) == 1
+    _check("执行轨迹：记录行/调用/返回/内置/开始事件", ok, str(kinds))
+
+    sid = data["session_id"]
+    # 任一步都能重建状态：调用点可见实参，进入后形参就位
+    call = next(e for e in data["events"] if e["kind"] == "call")
+    st = _SVC.trace_state(sid, call["seq"])
+    top = st["call_stack"][0]
+    ok_call = (top["function"] == "fib" and top["locals"].get("n", {}).get("value") == 5)
+    _check("执行轨迹：调用步可重建调用栈与变量", ok_call, str(top))
+
+    # 每个事件序号的重放都能正常终止（检查点 + 确定性重放）
+    last = data["total"] - 1
+    st_last = _SVC.trace_state(sid, last)
+    ok_last = st_last["finished"] and st_last["output"] == ["5"]
+    _check("执行轨迹：重放至末尾得到一致结果", ok_last, str(st_last.get("output")))
+
+    # 循环产生大量行事件时按上限截断，程序本身仍完整执行
+    loop = ("var s = 0;\n"
+            "for (var i = 0; i < 100000; i = i + 1) { s = s + i; }\n"
+            "print(s);")
+    d2 = _SVC.trace_run(loop, {"max_trace_events": 300, "checkpoint_every": 100})
+    ok2 = (d2["summary"]["truncated"] and d2["total"] == 300
+           and d2["output"] == ["4999950000"])
+    # 截断边界附近也能重放
+    st2 = _SVC.trace_state(d2["session_id"], 299)
+    ok2 = ok2 and st2["event"]["seq"] == 299
+    _check("执行轨迹：超上限截断不影响运行结果且仍可回放", ok2, str(d2["total"]))
+
+    # 运行期错误被记录为 error 事件并可重放到出错点
+    d3 = _SVC.trace_run("var a = [1];\nprint(a[5]);")
+    ok3 = d3["events"][-1]["kind"] == "error"
+    st3 = _SVC.trace_state(d3["session_id"], d3["total"] - 1)
+    ok3 = ok3 and st3["error"] is not None and "越界" in st3["error"]["message"]
+    _check("执行轨迹：错误事件携带诊断且可重放", ok3)
 
 
 def _test_profiler():

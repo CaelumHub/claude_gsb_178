@@ -25,6 +25,7 @@ from . import compiler as compiler_mod
 from . import vm as vm_mod
 from . import debugger as debugger_mod
 from . import profiler as profiler_mod
+from . import tracer as tracer_mod
 from . import diagnostics as diag
 from . import memory_model
 
@@ -95,6 +96,7 @@ class Service:
     def __init__(self):
         config.ensure_dirs()
         self.debug_sessions: Dict[str, "DebugSession"] = {}
+        self.trace_sessions: Dict[str, "TraceSession"] = {}
         self._session_counter = 0
 
     # ==================================================================
@@ -264,16 +266,26 @@ class Service:
             }
         vm = vm_mod.VM(result.bytecode, result.source_lines)
         prof = None
+        trace = None
         want_profile = options.get("profile", False)
         if want_profile:
             prof = profiler_mod.Profiler()
             vm.profiler = prof
             if options.get("sample", True):
                 prof.start_sampling(float(options.get("sample_interval_ms", 1.0)))
+        if options.get("trace", False):
+            trace = tracer_mod.ExecutionTracer(
+                checkpoint_every=int(options.get("checkpoint_every",
+                                                   config.TRACE_CHECKPOINT_EVERY)),
+                max_events=int(options.get("max_trace_events",
+                                           config.MAX_TRACE_EVENTS)))
+            trace.attach(vm)
         if options.get("inputs"):
             vm.input_queue = list(options["inputs"])
         vm.start()
         vm.run()
+        if trace is not None:
+            trace.on_finish(vm)
         if prof:
             prof.attach_vm(vm)
             prof.stop_sampling()
@@ -290,8 +302,79 @@ class Service:
             "elapsed_ms": round(vm.elapsed_ms(), 3),
             "profile": report,
             "memory": heap,
+            "trace_summary": trace.summary() if trace is not None else None,
         }
         return out
+
+    # ==================================================================
+    # 执行轨迹会话（内存驻留，口径与调试会话一致）
+    # ==================================================================
+    def trace_run(self, source, options=None):
+        """编译 -> 带轨迹运行 -> 驻留 TraceSession，返回会话首屏数据。"""
+        options = dict(options or {})
+        options["trace"] = True
+        result = compiler_mod.compile_source(source)
+        if not result.success:
+            return {
+                "ok": False,
+                "diagnostics": result.diagnostics.to_list(),
+                "output": [],
+                "stage": result.stage,
+            }
+        vm = vm_mod.VM(result.bytecode, result.source_lines)
+        trace = tracer_mod.ExecutionTracer(
+            checkpoint_every=int(options.get("checkpoint_every",
+                                               config.TRACE_CHECKPOINT_EVERY)),
+            max_events=int(options.get("max_trace_events",
+                                       config.MAX_TRACE_EVENTS)))
+        trace.attach(vm)
+        if options.get("inputs"):
+            vm.input_queue = list(options["inputs"])
+        vm.start()
+        vm.run()
+        trace.on_finish(vm)
+
+        sid = storage.new_id("trace")
+        sess = TraceSession(sid, result, trace, source,
+                            list(vm.output), vm.return_value,
+                            vm.error.to_dict() if vm.error else None,
+                            round(vm.elapsed_ms(), 3), vm.instruction_count)
+        # 控制内存驻留数量
+        if len(self.trace_sessions) >= config.MAX_TRACE_SESSIONS:
+            old = sorted(self.trace_sessions.values(), key=lambda s: s.created_at)
+            for s in old[:len(self.trace_sessions) - config.MAX_TRACE_SESSIONS + 1]:
+                self.trace_sessions.pop(s.id, None)
+        self.trace_sessions[sid] = sess
+        return sess.first_page(sid)
+
+    def trace_events(self, sid, offset=0, limit=200, kind=None, func=None):
+        sess = self.trace_sessions.get(sid)
+        if not sess:
+            return {"ok": False, "error": "轨迹会话不存在或已过期"}
+        return {"ok": True, "session_id": sid,
+                **sess.events_page(offset, limit, kind, func)}
+
+    def trace_state(self, sid, seq):
+        sess = self.trace_sessions.get(sid)
+        if not sess:
+            return {"ok": False, "error": "轨迹会话不存在或已过期"}
+        state = sess.state_at(int(seq))
+        if state is None:
+            return {"ok": False, "error": "轨迹为空"}
+        state["session_id"] = sid
+        return state
+
+    def trace_summary(self, sid):
+        sess = self.trace_sessions.get(sid)
+        if not sess:
+            return {"ok": False, "error": "轨迹会话不存在或已过期"}
+        return {"ok": True, "session_id": sid, "summary": sess.tracer.summary()}
+
+    def trace_sessions_list(self):
+        return [{"session_id": s.id, "created_at": s.created_at,
+                 "events": len(s.tracer.events),
+                 "truncated": s.tracer.truncated}
+                for s in self.trace_sessions.values()]
 
     def record_run(self, pid, vid, source, options=None):
         """运行并持久化运行记录到版本目录。"""
@@ -370,6 +453,48 @@ class Service:
         if not sess or not sess.vm:
             return None
         return sess.vm.heap.snapshot(sess.vm.frame_snapshot())
+
+
+class TraceSession:
+    """一次带轨迹的运行：持有编译产物与 ExecutionTracer，供分页查询/状态重建。"""
+
+    def __init__(self, sid, result, trace, source, output, return_value,
+                 error, elapsed_ms, instruction_count):
+        self.id = sid
+        self.result = result
+        self.tracer = trace
+        self.source = source
+        self.output = output
+        self.return_value = return_value
+        self.error = error
+        self.elapsed_ms = elapsed_ms
+        self.instruction_count = instruction_count
+        self.created_at = storage.now_iso()
+
+    def events_page(self, offset, limit, kind, func):
+        page = self.tracer.events_page(offset, limit, kind, func)
+        page["summary"] = self.tracer.summary()
+        page["source_lines"] = self.result.source_lines
+        page["output"] = self.output
+        page["error"] = self.error
+        page["elapsed_ms"] = self.elapsed_ms
+        return page
+
+    def first_page(self, sid):
+        data = {"ok": True, "session_id": sid,
+                "source": self.source,
+                "source_lines": self.result.source_lines,
+                "output": self.output,
+                "return_value": self.return_value,
+                "error": self.error,
+                "elapsed_ms": self.elapsed_ms,
+                "instruction_count": self.instruction_count}
+        data.update(self.events_page(0, 200, None, None))
+        return data
+
+    def state_at(self, seq):
+        return self.tracer.state_at(
+            self.result.bytecode, self.result.source_lines, seq)
 
 
 class DebugSession:

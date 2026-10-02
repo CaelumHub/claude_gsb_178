@@ -16,7 +16,7 @@ import os
 import re
 import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 from . import config
 from . import service as service_mod
@@ -42,6 +42,21 @@ _MIME = {
     ".woff2": "font/woff2",
     ".txt": "text/plain; charset=utf-8",
 }
+
+
+def _parse_qs(query: str) -> dict:
+    try:
+        return parse_qs(query, keep_blank_values=True)
+    except Exception:
+        return {}
+
+
+def _qs_int(qs, key, default):
+    try:
+        raw = qs.get(key, [None])[0]
+        return int(raw) if raw not in (None, "") else default
+    except (ValueError, TypeError):
+        return default
 
 
 def _read_body(handler) -> dict:
@@ -177,6 +192,31 @@ class Handler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/debug/([^/]+)/stop$", path)
         if m and method == "POST":
             return self._json(200, svc.debug_stop(m.group(1)))
+
+        # ---- 执行轨迹回放 ----
+        if path == "/api/trace/start" and method == "POST":
+            opts = body.get("options", {})
+            if not isinstance(opts, dict):
+                opts = {}
+            return self._json(200, svc.trace_run(body.get("source", ""), opts))
+        if path == "/api/trace" and method == "GET":
+            return self._json(200, {"ok": True, "sessions": svc.trace_sessions_list()})
+
+        m = re.match(r"^/api/trace/([^/]+)/events$", path)
+        if m and method == "GET":
+            qs = _parse_qs(query)
+            offset = max(0, _qs_int(qs, "offset", 0))
+            limit = min(500, max(1, _qs_int(qs, "limit", 200)))
+            kind = (qs.get("kind", [None])[0] or None)
+            func = (qs.get("func", [None])[0] or None)
+            return self._json(200, svc.trace_events(m.group(1), offset, limit, kind, func))
+        m = re.match(r"^/api/trace/([^/]+)/state$", path)
+        if m and method == "GET":
+            qs = _parse_qs(query)
+            return self._json(200, svc.trace_state(m.group(1), _qs_int(qs, "seq", 0)))
+        m = re.match(r"^/api/trace/([^/]+)/summary$", path)
+        if m and method == "GET":
+            return self._json(200, svc.trace_summary(m.group(1)))
 
         # ---- 设置 ----
         if path == "/api/settings" and method == "GET":

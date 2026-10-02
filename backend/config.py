@@ -43,6 +43,11 @@ MAX_LIST_LEN = 1_000_000                # 列表最大长度
 MAX_SAMPLE_INTERVAL_MS = 1000           # 采样剖析最大间隔（毫秒）
 MIN_SAMPLE_INTERVAL_MS = 1              # 采样剖析最小间隔（毫秒）
 
+# 执行轨迹：事件上限（截断记录，不影响程序执行）、检查点间隔、内存驻留会话数
+MAX_TRACE_EVENTS = 20000
+TRACE_CHECKPOINT_EVERY = 512
+MAX_TRACE_SESSIONS = 8
+
 
 def ensure_dirs():
     """确保运行所需的目录都存在（幂等）。"""

@@ -79,6 +79,7 @@ class VM:
         self.return_value = None
         self.profiler = None
         self.debugger = None
+        self.tracer = None
         self._start_time = None
         self._cur_line = 0
         self._functions = self._bind_functions()
@@ -139,6 +140,8 @@ class VM:
         self._start_time = time.perf_counter()
         if self.profiler:
             self.profiler.begin_run()
+        if self.tracer:
+            self.tracer.on_program_start(self)
 
     def current_position(self):
         if self.frames:
@@ -176,6 +179,13 @@ class VM:
         ins = code.instructions[frame.ip]
         frame.current_line = ins.line
         self._cur_line = ins.line
+        # 执行轨迹：行级事件（与调试器"指令前"判定、剖析器逐条上报同点）。
+        # 重放命中"执行前"目标时，本指令不再执行，光标停在该指令上。
+        if self.tracer:
+            self.tracer.before_instruction(self, frame, ins)
+            if getattr(self.tracer, "abort_step", False):
+                self.tracer.abort_step = False
+                return
         frame.ip += 1
         self.instruction_count += 1
         if self.profiler:
@@ -186,8 +196,13 @@ class VM:
             return
         try:
             self._dispatch(ins, frame)
+            if self.tracer:
+                self.tracer.after_instruction(self, frame, ins)
         except SystemExitSignal:
             self.finished = True
+            if self.tracer:
+                self.tracer.on_exit(self)
+                self.tracer.on_finish(self)
         except VMRuntimeError as e:
             self._handle_runtime_error(e)
 
@@ -214,6 +229,9 @@ class VM:
         self.finished = True
         if self.profiler:
             self.profiler.end_run()
+        if self.tracer:
+            self.tracer.on_error(self, e.diagnostic)
+            self.tracer.on_finish(self)
 
     def _runtime_error(self, d: diag.Diagnostic):
         raise VMRuntimeError(d)
@@ -432,6 +450,8 @@ class VM:
                 if self.profiler:
                     self.profiler.function_exit()
             frame.stack.append(result)
+            if self.tracer:
+                self.tracer.on_builtin_return(self, frame, ins, callee, args, result)
             return
         if isinstance(callee, rt.RuntimeFunction):
             self._call_user(ins, frame, callee, args)
@@ -451,6 +471,8 @@ class VM:
         if self.profiler:
             self.profiler.function_enter(func.name)
         self.frames.append(new_frame)
+        if self.tracer:
+            self.tracer.on_call_user(self, frame, new_frame, func, args, ins)
 
     def _do_return(self, frame, value):
         # 退出当前帧，把返回值交给上一帧
@@ -463,12 +485,15 @@ class VM:
             self.finished = True
             if self.profiler:
                 self.profiler.end_run()
+            if self.tracer:
+                self.tracer.on_return(self, frame, value, True)
             return
         # 弹出当前帧
-        caller_index = len(self.frames) - 2
         self.frames.pop()
         if self.frames:
-            self.frames[caller_index].stack.append(value)
+            self.frames[-1].stack.append(value)
+            if self.tracer:
+                self.tracer.on_return(self, frame, value, False)
 
     # ------------------------------------------------------------------
     # 名称 / 类型错误

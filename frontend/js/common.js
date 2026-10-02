@@ -18,6 +18,7 @@
     { key: "symbols",     href: "symbols.html",     icon: "🏷️", title: "符号表与作用域",  group: "编译前端" },
     { key: "bytecode",    href: "bytecode.html",    icon: "🧩", title: "字节码 / 中间代码", group: "编译前端" },
     { key: "debug",       href: "debug.html",       icon: "🐞", title: "执行跟踪与单步调试", group: "运行调试" },
+    { key: "trace",       href: "trace.html",       icon: "🎞️", title: "执行轨迹回放",      group: "运行调试" },
     { key: "callstack",   href: "callstack.html",   icon: "📚", title: "调用栈与变量监视", group: "运行调试" },
     { key: "memory",      href: "memory.html",      icon: "🧠", title: "内存模型可视化",  group: "运行调试" },
     { key: "diagnostics", href: "diagnostics.html", icon: "🩺", title: "错误诊断与修复",  group: "分析与优化" },
@@ -149,6 +150,16 @@
     debugCommand(sid, command, breakpoints) { return this.post(`/api/debug/${sid}/command`, { command, breakpoints }); },
     debugStop(sid) { return this.post(`/api/debug/${sid}/stop`); },
     debugSessions() { return this.get("/api/debug"); },
+
+    // ---- 执行轨迹回放 ----
+    traceStart(source, options) { return this.post("/api/trace/start", { source, options: options || {} }); },
+    traceEvents(sid, offset, limit, kind, func) {
+      let path = `/api/trace/${sid}/events?offset=${offset || 0}&limit=${limit || 200}`;
+      if (kind) path += "&kind=" + encodeURIComponent(kind);
+      if (func) path += "&func=" + encodeURIComponent(func);
+      return this.get(path);
+    },
+    traceState(sid, seq) { return this.get(`/api/trace/${sid}/state?seq=${seq}`); },
 
     // ---- 设置 ----
     getSettings() { return this.get("/api/settings"); },

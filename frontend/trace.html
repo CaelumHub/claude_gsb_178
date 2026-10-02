@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>执行轨迹回放 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+        </div>
+        <div class="flex wrap" style="gap:8px">
+          <label class="flex" style="gap:4px;font-size:12px;color:var(--text-muted)">事件上限
+            <input type="number" id="max-events" value="20000" min="100" step="100" style="width:86px">
+          </label>
+          <button class="btn primary" id="btn-record">⏺ 运行并记录轨迹</button>
+        </div>
+      </div>
+
+      <div id="editor"></div>
+
+      <div id="tr-status" class="flex wrap mt" style="gap:8px;min-height:26px"></div>
+
+      <div id="trace-panel" style="display:none" class="mt">
+        <div class="trace-wrap">
+          <!-- 左：步进列表 -->
+          <div class="card" style="padding:0;overflow:hidden">
+            <div class="flex wrap between" style="padding:10px 12px;border-bottom:1px solid var(--border);gap:8px">
+              <h2 style="margin:0;font-size:14px">🎞️ 执行步骤</h2>
+              <div class="flex wrap" style="gap:6px">
+                <select id="filter-kind" class="pager-sel" style="font-size:12px">
+                  <option value="all">全部步骤</option>
+                  <option value="steps">仅源行</option>
+                  <option value="calls">调用 / 返回</option>
+                  <option value="errors">仅出错</option>
+                </select>
+              </div>
+            </div>
+            <div id="trace-list" class="trace-list" style="max-height:560px;overflow:auto"></div>
+            <div class="trace-page pager">
+              <button class="btn sm" id="pg-first">« 首页</button>
+              <button class="btn sm" id="pg-prev">‹ 上一页</button>
+              <span id="pg-info" class="muted" style="flex:1;text-align:center"></span>
+              <button class="btn sm" id="pg-next">下一页 ›</button>
+              <button class="btn sm" id="pg-last">末页 »</button>
+            </div>
+          </div>
+
+          <!-- 右：选中步骤详情 -->
+          <div>
+            <div class="card">
+              <h2>🔎 第 <span id="d-seq">—</span> 步</h2>
+              <div id="d-badges" class="trace-detail mb"></div>
+              <div id="d-desc" class="mono" style="font-size:13px;margin-bottom:8px"></div>
+              <div class="trace-code" id="d-code"><div class="muted" style="padding:10px">运行并记录轨迹后，点击左侧任意步骤查看执行位置。</div></div>
+            </div>
+
+            <div class="card mt">
+              <h2>📚 调用栈与变量</h2>
+              <div id="d-frames"></div>
+              <h3>全局变量</h3>
+              <div id="d-globals"></div>
+              <div class="grid cols-2 mt">
+                <div>
+                  <h3>操作数栈（当前帧栈顶）</h3>
+                  <div id="d-operand"></div>
+                </div>
+                <div>
+                  <h3>▶ 到此为止的输出</h3>
+                  <div class="output-console" id="d-output" style="min-height:60px;max-height:160px"></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card mt">
+              <h2>▶️ 回放控制</h2>
+              <div class="flex wrap" style="gap:8px">
+                <button class="btn sm" id="ply-start">⏮ 第一步</button>
+                <button class="btn sm" id="ply-prev">‹ 上一步</button>
+                <button class="btn primary sm" id="ply-play">▶ 自动播放</button>
+                <button class="btn sm" id="ply-next">下一步 ›</button>
+                <button class="btn sm" id="ply-end">最后一步 ⏭</button>
+                <label class="flex" style="gap:4px;font-size:12px;color:var(--text-muted)">速度
+                  <select id="ply-speed" style="font-size:12px">
+                    <option value="1200">慢</option>
+                    <option value="500" selected>中</option>
+                    <option value="150">快</option>
+                  </select>
+                </label>
+                <span id="ply-pos" class="muted" style="font-size:12px"></span>
+              </div>
+              <div class="muted mt" style="font-size:12px">
+                键盘：<kbd>←</kbd>/<kbd>→</kbd> 切换步骤，<kbd>Space</kbd> 播放/暂停。
+                步骤口径与「单步调试」的 step_into、以及「性能分析」的行命中完全一致。
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script>
+(function () {
+  ML.Shell.render("trace");
+  ML.Shell.setTitle("执行轨迹回放");
+
+  const esc = ML.escapeHtml;
+  const PAGE = 200;
+
+  const editor = new ML.CodeEditor(document.getElementById("editor"), {
+    value: ML.store.get("draft_source", ML.DEFAULT_CODE), height: 240,
+    autocomplete: false,
+    onValueChange: ML.debounce((v) => ML.store.set("draft_source", v), 400),
+  });
+  const sampleSel = document.getElementById("sample");
+  sampleSel.innerHTML = '<option value="">— 载入示例 —</option>' +
+    ML.SAMPLES.map((s, i) => `<option value="${i}">${esc(s.name)}</option>`).join("");
+  sampleSel.onchange = () => { if (sampleSel.value !== "") { editor.setValue(ML.SAMPLES[sampleSel.value].code); sampleSel.value = ""; } };
+  document.getElementById("btn-loadproj").onclick = async () => editor.setValue(await ML.Shell.loadSource(ML.DEFAULT_CODE));
+
+  /* ---------------- 会话状态 ---------------- */
+  let sid = null;
+  let sourceLines = [];
+  let summary = null;
+  let pageEvents = [];
+  let pageOffset = 0;
+  let pageTotal = 0;
+  let selectedSeq = null;
+  let filterKind = "all";
+  let playTimer = null;
+
+  const KIND_META = {
+    start:   ["start",   "开始", "▶", "purple"],
+    line:    ["line",    "源行", "›", "gray"],
+    call:    ["call",    "调用", "↓", "green"],
+    return:  ["return",  "返回", "↑", "blue"],
+    builtin: ["builtin", "内置", "ƒ", "cyan"],
+    error:   ["error",   "出错", "✖", "red"],
+  };
+
+  /* ---------------- 记录 ---------------- */
+  document.getElementById("btn-record").onclick = async () => {
+    stopPlay();
+    const maxEvents = parseInt(document.getElementById("max-events").value, 10) || 20000;
+    const code = editor.getValue();
+    ML.toast("正在运行并记录轨迹…");
+    const data = await ML.api.traceStart(code, { max_trace_events: maxEvents });
+    if (!data.ok) {
+      ML.toast("编译失败，无法记录轨迹", "err");
+      document.getElementById("tr-status").innerHTML = ML.renderDiagnostics(data.diagnostics, code);
+      document.getElementById("trace-panel").style.display = "none";
+      sid = null;
+      return;
+    }
+    sid = data.session_id;
+    sourceLines = data.source_lines || code.split("\n");
+    summary = data.summary;
+    pageEvents = data.events || [];
+    pageOffset = data.offset || 0;
+    pageTotal = data.total || 0;
+    filterKind = "all";
+    document.getElementById("filter-kind").value = "all";
+    document.getElementById("trace-panel").style.display = "block";
+    renderStatus(data);
+    renderList();
+    selectSeq(0);
+    ML.toast(summary.truncated ? "轨迹已达上限并截断（程序已完整执行）" : "轨迹记录完成",
+             summary.truncated ? "err" : "ok");
+  };
+
+  function renderStatus(data) {
+    const counts = summary.counts || {};
+    const el = document.getElementById("tr-status");
+    el.innerHTML =
+      ML.badge("步骤 " + summary.total_events, "blue") +
+      ML.badge("源行 " + (counts.line || 0), "gray") +
+      ML.badge("调用 " + (counts.call || 0), "green") +
+      ML.badge("返回 " + (counts.return || 0), "gray") +
+      ML.badge("内置 " + (counts.builtin || 0), "cyan") +
+      ML.badge("最大深度 " + summary.max_depth, "purple") +
+      ML.badge("指令 " + (summary.instruction_count), "gray") +
+      ML.badge("⏱ " + ML.fmtMs(data.elapsed_ms), "gray") +
+      (summary.truncated ? ML.badge("⚠ 已在第 " + summary.max_events + " 步截断（循环/递归步骤过多，列表按页加载）", "red") : "") +
+      (data.error ? ML.badge("运行出错：" + data.error.message, "red") : ML.badge("运行完成", "green"));
+  }
+
+  /* ---------------- 步进列表（分页） ---------------- */
+  async function fetchPage(offset) {
+    if (!sid) return;
+    const data = await ML.api.traceEvents(sid, offset, PAGE, filterKind === "all" ? null : filterKind, null);
+    if (!data.ok) { ML.toast(data.error || "加载失败", "err"); return; }
+    pageEvents = data.events || [];
+    pageOffset = data.offset;
+    pageTotal = data.total;
+    summary = data.summary;
+    sourceLines = data.source_lines || sourceLines;
+    renderList();
+    updatePager();
+  }
+
+  function eventRowHtml(ev) {
+    const meta = KIND_META[ev.kind] || ["", ev.kind, "•", "gray"];
+    const indent = "┊".repeat(Math.min(ev.depth || 0, 12));
+    let main = "";
+    if (ev.kind === "start") {
+      main = `<span class="fn">&lt;main&gt;</span> 程序入口`;
+    } else if (ev.kind === "line") {
+      main = `<span class="fn">${esc(ev.func)}</span> 执行到 L${ev.line}`;
+    } else if (ev.kind === "call") {
+      main = `调用 <span class="fn">${esc(ev.callee)}</span>(${fmtArgs(ev.args)})`;
+    } else if (ev.kind === "return") {
+      main = `<span class="fn">${esc(ev.callee)}</span> 返回 ${ev.result ? ML.fmtVal(ev.result) : ""}`;
+    } else if (ev.kind === "builtin") {
+      main = `内置 <span class="fn">${esc(ev.callee)}</span>(${fmtArgs(ev.args)}) → ${ev.result ? ML.fmtVal(ev.result) : ""}`;
+    } else if (ev.kind === "error") {
+      main = `✖ ${esc(ev.message || "")}`;
+    }
+    return `<div class="trace-row k-${meta[0]}${ev.seq === selectedSeq ? " sel" : ""}" data-seq="${ev.seq}">
+      <span class="seq">${ev.seq}</span>
+      <span class="ind">${indent}</span>
+      <span class="main">${main}</span>
+      <span class="ln">L${ev.line || 0}</span>
+    </div>`;
+  }
+
+  function fmtArgs(args) {
+    if (!args || !args.length) return "";
+    return args.map((a) => ML.fmtValText(a)).join(", ");
+  }
+
+  function renderList() {
+    const el = document.getElementById("trace-list");
+    if (!pageEvents.length) { el.innerHTML = ML.empty("当前过滤条件下没有步骤"); return; }
+    el.innerHTML = pageEvents.map(eventRowHtml).join("");
+    el.querySelectorAll(".trace-row").forEach((row) => {
+      row.onclick = () => selectSeq(parseInt(row.dataset.seq, 10));
+    });
+    updatePager();
+    const sel = el.querySelector(".trace-row.sel");
+    if (sel) sel.scrollIntoView({ block: "nearest" });
+  }
+
+  function updatePager() {
+    const from = pageTotal ? pageOffset + 1 : 0;
+    const to = Math.min(pageOffset + PAGE, pageTotal);
+    document.getElementById("pg-info").textContent = `第 ${from}–${to} / 共 ${pageTotal} 步`;
+    document.getElementById("pg-prev").disabled = pageOffset <= 0;
+    document.getElementById("pg-first").disabled = pageOffset <= 0;
+    document.getElementById("pg-next").disabled = pageOffset + PAGE >= pageTotal;
+    document.getElementById("pg-last").disabled = pageOffset + PAGE >= pageTotal;
+  }
+
+  document.getElementById("pg-first").onclick = () => { stopPlay(); fetchPage(0); };
+  document.getElementById("pg-prev").onclick = () => { stopPlay(); fetchPage(Math.max(0, pageOffset - PAGE)); };
+  document.getElementById("pg-next").onclick = () => { stopPlay(); fetchPage(pageOffset + PAGE); };
+  document.getElementById("pg-last").onclick = () => { stopPlay(); fetchPage(Math.floor((pageTotal - 1) / PAGE) * PAGE); };
+  document.getElementById("filter-kind").onchange = (e) => {
+    stopPlay(); filterKind = e.target.value; fetchPage(0);
+  };
+
+  /* ---------------- 选中一步：重建状态 ---------------- */
+  async function selectSeq(seq) {
+    if (!sid || seq == null || isNaN(seq)) return;
+    selectedSeq = seq;
+    const st = await ML.api.traceState(sid, seq);
+    if (!st.ok) { ML.toast(st.error || "状态重建失败", "err"); return; }
+    document.getElementById("d-seq").textContent = seq;
+    renderDetail(st);
+    renderList();
+    document.getElementById("ply-pos").textContent = `第 ${seq} / ${summary.total_events - 1} 步`;
+  }
+
+  function renderDetail(st) {
+    const ev = st.event || {};
+    const meta = KIND_META[ev.kind] || ["", ev.kind, "•", "gray"];
+    const badges = document.getElementById("d-badges");
+    badges.innerHTML =
+      ML.badge(meta[1], meta[3]) +
+      ML.badge((ev.callee ? ev.callee : ev.func) || "?", "gray") +
+      ML.badge("L" + (ev.line || 0), "gray") +
+      ML.badge("深度 " + (ev.depth || 0), "purple") +
+      (st.finished ? ML.badge("程序已结束", "green") : "");
+
+    // 描述（调用参数 / 返回值 / 错误信息）
+    let desc = "";
+    if (ev.kind === "call") desc = `进入函数 <b>${esc(ev.callee)}</b>，实参 (${fmtArgs(ev.args)})`;
+    else if (ev.kind === "return") desc = `<b>${esc(ev.callee)}</b> 返回到 <b>${esc(ev.func)}</b>，返回值 ${ev.result ? ML.fmtVal(ev.result) : "null"}`;
+    else if (ev.kind === "builtin") desc = `调用内置 <b>${esc(ev.callee)}</b>(${fmtArgs(ev.args)}) → ${ev.result ? ML.fmtVal(ev.result) : "null"}`;
+    else if (ev.kind === "line") desc = `<b>${esc(ev.func)}</b> 即将执行第 ${ev.line} 行`;
+    else if (ev.kind === "start") desc = "程序即将开始执行（main 帧已建立）";
+    else if (ev.kind === "error") desc = `<span style="color:var(--danger)">✖ ${esc(ev.message || "")}</span>`;
+    document.getElementById("d-desc").innerHTML = desc;
+
+    // 源码位置：优先"下一指令"所在行（与调试页 currentLine 口径一致）；
+    // 调用/返回/结束步没有下一指令时，回退到事件记录的行号
+    const nextLine = st.next_instruction ? st.next_instruction.line
+      : (ev.line || (st.current_position ? st.current_position[1] : 0));
+    renderCode(nextLine, ev);
+
+    // 调用栈
+    const frames = st.call_stack || [];
+    const fe = document.getElementById("d-frames");
+    if (!frames.length) fe.innerHTML = ML.empty("调用栈为空（程序已返回）");
+    else fe.innerHTML = `<div class="callstack">` + frames.map((f, i) =>
+      `<div class="frame ${i === 0 ? "top" : ""}">
+        <div class="flex between" style="cursor:pointer" data-f="1">
+          <span><span class="fn">${esc(f.function)}</span><span class="ln">L${f.line}</span>
+          ${f.is_main ? '<span class="badge gray">main</span>' : ""} ${i === 0 ? '<span class="badge cyan">当前帧</span>' : ""}</span>
+          <span class="muted" style="font-size:11px">${Object.keys(f.locals || {}).length} 变量 ▾</span>
+        </div>
+        <div class="frame-locals" style="display:${i === 0 ? "block" : "none"};margin-top:8px">${renderVars(f.locals)}</div>
+      </div>`).join("") + `</div>`;
+    fe.querySelectorAll("[data-f]").forEach((hdr) => {
+      hdr.onclick = () => { const box = hdr.nextElementSibling; box.style.display = box.style.display === "none" ? "block" : "none"; };
+    });
+
+    document.getElementById("d-globals").innerHTML = renderVars(st.globals || {});
+
+    const opstack = st.operand_stack || [];
+    document.getElementById("d-operand").innerHTML = opstack.length
+      ? opstack.slice().reverse().map((v, i) => `<div class="mono" style="padding:2px 0">${i === 0 ? "栈顶 " : "     "}${ML.fmtVal(v)}</div>`).join("")
+      : '<span class="muted">（空）</span>';
+
+    const out = document.getElementById("d-output");
+    out.innerHTML = (st.output || []).length
+      ? st.output.map((l) => `<span class="ln-out">${esc(l)}</span>`).join("<br>")
+      : '<span class="muted">（暂无输出）</span>';
+  }
+
+  function renderVars(vars) {
+    const keys = Object.keys(vars || {});
+    if (!keys.length) return '<span class="muted">（无）</span>';
+    return `<table class="tbl var-table"><thead><tr><th>名称</th><th>值</th></tr></thead><tbody>` +
+      keys.map((k) => `<tr><td class="mono">${esc(k)}</td><td class="v">${ML.fmtVal(vars[k])}</td></tr>`).join("") +
+      `</tbody></table>`;
+  }
+
+  function renderCode(activeLine, ev) {
+    const el = document.getElementById("d-code");
+    if (!sourceLines || !sourceLines.length) { el.innerHTML = ""; return; }
+    const windowSize = 10;
+    const start = Math.max(1, activeLine - windowSize);
+    const end = Math.min(sourceLines.length, activeLine + windowSize);
+    let html = "";
+    if (start > 1) html += `<div class="cl"><span class="no">…</span><span></span></div>`;
+    for (let i = start; i <= end; i++) {
+      const text = sourceLines[i - 1] == null ? "" : sourceLines[i - 1];
+      html += `<div class="cl${i === activeLine ? " cur" : ""}"><span class="no">${i}</span><span>${ML.Highlighter.highlight(text) || "​"}</span></div>`;
+    }
+    if (end < sourceLines.length) html += `<div class="cl"><span class="no">…</span><span></span></div>`;
+    el.innerHTML = html;
+    const cur = el.querySelector(".cl.cur");
+    if (cur) cur.scrollIntoView({ block: "center" });
+  }
+
+  /* ---------------- 回放控制 ---------------- */
+  // 播放按"原始 seq"前进；若选中步不在当前页，先把所在页加载出来再渲染。
+  async function ensureSeqVisible(seq) {
+    if (pageEvents.some((e) => e.seq === seq)) return;
+    const off = Math.floor(seq / PAGE) * PAGE;
+    await fetchPage(off);
+  }
+
+  async function gotoStep(delta) {
+    if (!sid) return;
+    let next = selectedSeq + delta;
+    next = Math.max(0, Math.min(summary.total_events - 1, next));
+    if (filterKind !== "all") {
+      // 过滤模式下跳到相邻的可见步：优先在本页找，否则翻到相邻页取首/末条
+      const idx = pageEvents.findIndex((e) => e.seq === selectedSeq);
+      if (idx >= 0 && pageEvents[idx + delta]) {
+        next = pageEvents[idx + delta].seq;
+      } else if (delta > 0 && pageOffset + PAGE < pageTotal) {
+        await fetchPage(pageOffset + PAGE);
+        if (pageEvents.length) next = pageEvents[0].seq;
+      } else if (delta < 0 && pageOffset > 0) {
+        await fetchPage(Math.max(0, pageOffset - PAGE));
+        if (pageEvents.length) next = pageEvents[pageEvents.length - 1].seq;
+      }
+    } else {
+      await ensureSeqVisible(next);
+    }
+    await selectSeq(next);
+  }
+
+  function stopPlay() {
+    if (playTimer) { clearInterval(playTimer); playTimer = null; }
+    document.getElementById("ply-play").textContent = "▶ 自动播放";
+  }
+  function togglePlay() {
+    if (playTimer) { stopPlay(); return; }
+    document.getElementById("ply-play").textContent = "⏸ 暂停";
+    const speed = parseInt(document.getElementById("ply-speed").value, 10) || 500;
+    playTimer = setInterval(async () => {
+      if (selectedSeq >= summary.total_events - 1) { stopPlay(); return; }
+      await gotoStep(1);
+    }, speed);
+  }
+
+  document.getElementById("ply-start").onclick = () => { stopPlay(); selectSeq(0); };
+  document.getElementById("ply-prev").onclick = () => { stopPlay(); gotoStep(-1); };
+  document.getElementById("ply-next").onclick = () => { stopPlay(); gotoStep(1); };
+  document.getElementById("ply-end").onclick = () => { stopPlay(); selectSeq(summary.total_events - 1); };
+  document.getElementById("ply-play").onclick = togglePlay;
+
+  document.addEventListener("keydown", (e) => {
+    if (!sid || e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+    if (e.key === "ArrowRight") { stopPlay(); gotoStep(1); e.preventDefault(); }
+    else if (e.key === "ArrowLeft") { stopPlay(); gotoStep(-1); e.preventDefault(); }
+    else if (e.key === " ") { togglePlay(); e.preventDefault(); }
+  });
+})();
+</script>
+</body>
+</html>
