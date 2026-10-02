@@ -133,6 +133,7 @@
       opts = opts || {};
       this.container = container;
       this.breakpointsEnabled = !!opts.breakpoints;
+      this.readonly = !!opts.readonly;
       this.onBreakpointChange = opts.onBreakpointChange || null;
       this.onValueChange = opts.onValueChange || null;
       this.autocomplete = opts.autocomplete !== false;
@@ -171,6 +172,7 @@
       this.ta.className = "src";
       this.ta.spellcheck = false;
       this.ta.wrap = "off";
+      this.ta.readOnly = this.readonly;
       this.ta.setAttribute("autocapitalize", "off");
       this.ta.setAttribute("autocorrect", "off");
 
@@ -213,6 +215,19 @@
     setValue(code) {
       this.ta.value = code;
       this._render();
+    }
+
+    setReadonly(ro) {
+      this.readonly = !!ro;
+      this.ta.readOnly = this.readonly;
+    }
+
+    /* 把指定行滚动到可视区中央（轨迹回放 / 调试高亮用） */
+    scrollToLine(line) {
+      if (!line || line < 1) return;
+      const target = Math.max(0, (line - 1) * 20 - this.ta.clientHeight / 2 + 10);
+      this.ta.scrollTop = target;
+      this._syncScroll();
     }
 
     getBreakpoints() { return Array.from(this._bps).sort((a, b) => a - b); }

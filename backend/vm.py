@@ -21,6 +21,7 @@ from typing import List, Dict, Any, Optional
 from . import bytecode as bc
 from . import runtime as rt
 from . import diagnostics as diag
+from . import tracer as tracer_mod
 from .memory_model import Heap
 
 
@@ -79,6 +80,7 @@ class VM:
         self.return_value = None
         self.profiler = None
         self.debugger = None
+        self.tracer = None
         self._start_time = None
         self._cur_line = 0
         self._functions = self._bind_functions()
@@ -139,6 +141,8 @@ class VM:
         self._start_time = time.perf_counter()
         if self.profiler:
             self.profiler.begin_run()
+        if self.tracer:
+            self.tracer.begin_run(self)
 
     def current_position(self):
         if self.frames:
@@ -171,21 +175,32 @@ class VM:
         code = frame.code
         if frame.ip >= len(code.instructions):
             # 隐式返回
+            self._check_trace_stop()
             self._do_return(frame, None)
             return
         ins = code.instructions[frame.ip]
-        frame.current_line = ins.line
-        self._cur_line = ins.line
-        frame.ip += 1
-        self.instruction_count += 1
         if self.profiler:
             self.profiler.record_instruction(frame.func_name, ins.line)
+        # 行号在钩子前更新（调试器也以此读到当前源码行）；ip 延后到钩子后推进，
+        # 保证回放停在钩子处时 peek_instruction() 仍是这条指令、检查点为干净边界
+        frame.current_line = ins.line
+        self._cur_line = ins.line
+        if self.tracer:
+            # 与调试器"单步"同一判定位置：下一指令尚未执行。
+            # 达到轨迹事件上限时 TraceLimitReached 向上传播，由运行入口收尾。
+            self.tracer.on_instruction(self, frame, ins)
+        frame.ip += 1
+        self.instruction_count += 1
         if self.instruction_count > self.instruction_limit:
             self._runtime_error(diag.runtime_instruction_limit(
                 self.instruction_limit, ins.line, 1, self._line(ins.line)))
             return
         try:
             self._dispatch(ins, frame)
+        except tracer_mod.TraceStop:
+            # 在指令执行中间（函数进入 / 返回）命中回放目标：向上传播，
+            # 由 run() 统一置为暂停状态
+            raise
         except SystemExitSignal:
             self.finished = True
         except VMRuntimeError as e:
@@ -194,7 +209,15 @@ class VM:
     def run(self, pause_fn=None, on_pause=None, max_steps=None):
         """持续执行直到 pause_fn 返回 True、程序结束、出错、或步数耗尽。"""
         steps = 0
-        while not self.finished and self.frames:
+        while True:
+            # 回放可能在指令执行中间（内建调用前 / main 返回）已命中目标并置暂停；
+            # 检查放在帧栈判断之前，确保停在最后一步时不再推进
+            if self.tracer is not None and self.tracer.should_pause(self):
+                self.paused = True
+                self.pause_reason = "trace"
+                return self
+            if self.finished or not self.frames:
+                return self
             if pause_fn is not None and pause_fn(self):
                 self.paused = True
                 self.pause_reason = getattr(self.debugger, "pause_reason", "pause")
@@ -203,20 +226,32 @@ class VM:
                 return self
             if max_steps is not None and steps >= max_steps:
                 return self
-            self.step_instruction()
+            try:
+                self.step_instruction()
+            except tracer_mod.TraceStop:
+                # 轨迹回放到达目标步骤：状态停在该步，等待下一次请求（同暂停语义）
+                self.paused = True
+                self.pause_reason = "trace"
+                return self
             steps += 1
             if self.paused:
                 return self
-        return self
 
     def _handle_runtime_error(self, e: VMRuntimeError):
         self.error = e.diagnostic
         self.finished = True
+        if self.tracer:
+            self.tracer.on_error(self, e.diagnostic)
         if self.profiler:
             self.profiler.end_run()
 
     def _runtime_error(self, d: diag.Diagnostic):
         raise VMRuntimeError(d)
+
+    def _check_trace_stop(self):
+        """指令执行过程中（返回路径）在产生副作用前检查回放是否已到目标。"""
+        if self.tracer and self.tracer.should_pause(self):
+            raise tracer_mod.TraceStop()
 
     def _line(self, line):
         if 0 <= line - 1 < len(self.source_lines):
@@ -283,8 +318,10 @@ class VM:
         elif op == bc.OP_CALL:
             self._call(ins, frame)
         elif op == bc.OP_RETURN:
+            self._check_trace_stop()
             self._do_return(frame, s.pop() if s else None)
         elif op == bc.OP_RETURN_NONE:
+            self._check_trace_stop()
             self._do_return(frame, None)
         elif op == bc.OP_MAKE_LIST:
             items = s[-ins.operand:] if ins.operand else []
@@ -424,13 +461,24 @@ class VM:
         if isinstance(callee, rt.BuiltinFunction):
             if self.profiler:
                 self.profiler.function_enter("builtin:" + callee.name)
-            try:
-                result = callee.fn(args)
-            except VMRuntimeError:
-                raise
-            finally:
-                if self.profiler:
-                    self.profiler.function_exit()
+            # call 事件可能就是回放目标：钩子已令 tracer 暂停，不再真正执行内建
+            if self.tracer and self.tracer.should_pause(self):
+                raise tracer_mod.TraceStop()
+            # 回放非确定性内建（time/random）时注入录制值，保证重放一致
+            if self.tracer:
+                nd_idx = self.tracer.current_nondet_index
+                result = self.tracer.replay_builtin(self, callee, args, nd_idx)
+            else:
+                result = tracer_mod.PROCEED
+            if result is tracer_mod.PROCEED:
+                try:
+                    result = callee.fn(args)
+                except VMRuntimeError:
+                    raise
+            if self.tracer:
+                self.tracer.after_builtin(self, callee, result)
+            if self.profiler:
+                self.profiler.function_exit()
             frame.stack.append(result)
             return
         if isinstance(callee, rt.RuntimeFunction):
@@ -451,8 +499,14 @@ class VM:
         if self.profiler:
             self.profiler.function_enter(func.name)
         self.frames.append(new_frame)
+        if self.tracer:
+            # enter 事件在新帧已压入、尚未执行其首条指令时发出（同调试器调用栈口径）
+            self.tracer.on_enter(self, new_frame, ins)
 
     def _do_return(self, frame, value):
+        # return 事件在帧弹出前发出（能看到返回值与完整调用栈）
+        if self.tracer:
+            self.tracer.on_return(self, frame, value)
         # 退出当前帧，把返回值交给上一帧
         if self.profiler and not frame.is_main:
             self.profiler.function_exit()
@@ -463,6 +517,9 @@ class VM:
             self.finished = True
             if self.profiler:
                 self.profiler.end_run()
+            # 回放停在 main 返回事件时，TraceStop 必须继续向上传播
+            if self.tracer and self.paused:
+                raise tracer_mod.TraceStop()
             return
         # 弹出当前帧
         caller_index = len(self.frames) - 2

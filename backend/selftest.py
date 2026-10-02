@@ -16,6 +16,7 @@ from . import compiler
 from . import vm as vm_mod
 from . import debugger as debugger_mod
 from . import profiler as profiler_mod
+from . import tracer as tracer_mod
 from . import storage
 from . import memory_model
 from . import diagnostics as diag
@@ -52,6 +53,7 @@ def run_all():
     _test_runtime_errors()
     _test_debugger()
     _test_profiler()
+    _test_tracer()
     _test_memory_model()
     _test_storage()
     _test_concurrent_writes()
@@ -191,6 +193,59 @@ def _test_profiler():
     fn_names = [f["name"] for f in prof.get("functions", [])]
     ok2 = any("work" in n for n in fn_names)
     _check("剖析器：插桩统计函数调用与指令数", ok and ok2, str(fn_names) if not (ok and ok2) else "")
+
+
+def _test_tracer():
+    from . import service
+    svc = service.Service()
+    # 1) 递归：进入 / 返回事件覆盖每次调用，步数列表含行 / 调用 / 进入 / 返回
+    src = ("func fib(n) {\n"
+           "    if (n < 2) { return n; }\n"
+           "    return fib(n - 1) + fib(n - 2);\n"
+           "}\n"
+           "print(fib(8));")
+    trace = svc.trace_start(src, {})
+    counts = trace["type_counts"]
+    ok_types = (counts["line"] > 0 and counts["call"] > 0
+                and counts["enter"] > 0 and counts["return"] > 0)
+    _check("轨迹：录制行/调用/进入/返回事件（覆盖递归）", ok_types and trace["output"] == ["21"],
+           str(counts))
+
+    # 2) 任意一步可查看执行位置、变量与调用栈
+    enters = [e for e in trace["events"] if e[tracer_mod.I_TYPE] == tracer_mod.EV_ENTER]
+    st = svc.trace_state_at(trace["id"], enters[20][tracer_mod.I_SEQ])
+    ok_snap = (st and st["call_stack"] and "locals" in st["call_stack"][0]
+               and "n" in st["call_stack"][0]["locals"] and st["globals"] is not None)
+    _check("轨迹：点击任意一步查看位置/变量/调用栈", bool(ok_snap))
+
+    # 3) 非确定性内建（random）多次回放结果一致
+    src2 = 'print(random());\nprint(random());'
+    t2 = svc.trace_start(src2, {})
+    f1 = svc.trace_state_at(t2["id"], t2["event_count"] - 1)
+    f2 = svc.trace_state_at(t2["id"], t2["event_count"] - 1)
+    _check("轨迹：random 回放确定且与录制一致",
+           f1["output"] == f2["output"] == t2["output"], str(f1["output"]))
+
+    # 4) 循环产生大量步骤时截断保护，截断处仍可回放
+    src3 = 'var s = 0;\nwhile (s < 100000000) { s = s + 1; }\nprint(s);'
+    t3 = svc.trace_start(src3, {"trace_max_events": 500})
+    st3 = svc.trace_state_at(t3["id"], t3["event_count"] - 1)
+    _check("轨迹：海量循环步骤截断保护且末步可回放",
+           t3["truncated"] and t3["event_count"] == 500 and st3 is not None,
+           f'trunc={t3["truncated"]} n={t3["event_count"]}')
+
+    # 5) 出错事件携带结构化诊断，与调试/剖析同口径
+    t4 = svc.trace_start("var a = [1];\nprint(a[5]);", {})
+    err_evs = [e for e in t4["events"] if e[tracer_mod.I_TYPE] == tracer_mod.EV_ERROR]
+    st4 = svc.trace_state_at(t4["id"], err_evs[0][tracer_mod.I_SEQ])
+    _check("轨迹：运行时错误事件可回放并带诊断",
+           bool(err_evs) and st4["error"] is not None and "越界" in st4["error"]["message"])
+
+    # 6) 指令级粒度
+    t5 = svc.trace_start("var x = 1 + 2; print(x);",
+                         {"trace_granularity": "instruction"})
+    _check("轨迹：指令级粒度录制每一步",
+           t5["type_counts"]["insn"] > t5["type_counts"]["line"])
 
 
 def _test_memory_model():

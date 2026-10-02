@@ -25,6 +25,7 @@ from . import compiler as compiler_mod
 from . import vm as vm_mod
 from . import debugger as debugger_mod
 from . import profiler as profiler_mod
+from . import tracer as tracer_mod
 from . import diagnostics as diag
 from . import memory_model
 
@@ -95,6 +96,7 @@ class Service:
     def __init__(self):
         config.ensure_dirs()
         self.debug_sessions: Dict[str, "DebugSession"] = {}
+        self.trace_sessions: Dict[str, "TraceSession"] = {}
         self._session_counter = 0
 
     # ==================================================================
@@ -264,22 +266,40 @@ class Service:
             }
         vm = vm_mod.VM(result.bytecode, result.source_lines)
         prof = None
+        tracer = None
         want_profile = options.get("profile", False)
         if want_profile:
             prof = profiler_mod.Profiler()
             vm.profiler = prof
             if options.get("sample", True):
                 prof.start_sampling(float(options.get("sample_interval_ms", 1.0)))
+        # 执行轨迹：与剖析共用同一批 VM 钩子，口径一致、可同时开启
+        trace_id = None
+        if options.get("trace"):
+            tracer = tracer_mod.Tracer(
+                mode="record",
+                granularity=options.get("trace_granularity", "line"),
+                max_events=options.get("trace_max_events", tracer_mod.DEFAULT_MAX_EVENTS))
+            vm.tracer = tracer
         if options.get("inputs"):
             vm.input_queue = list(options["inputs"])
         vm.start()
-        vm.run()
+        if tracer is not None:
+            # 初始检查点：程序入口、任何指令执行前（seq = -1）
+            tracer.add_checkpoint(vm, -1)
+        try:
+            vm.run()
+        except tracer_mod.TraceLimitReached:
+            pass  # 轨迹截断；已录部分有效
         if prof:
             prof.attach_vm(vm)
             prof.stop_sampling()
             report = prof.report()
         else:
             report = None
+        if tracer is not None:
+            trace_id = self._persist_trace(source, options, result.source_lines,
+                                           vm, tracer)
         heap = vm.heap.snapshot([]) if options.get("memory", False) else None
         out = {
             "ok": True,
@@ -291,6 +311,8 @@ class Service:
             "profile": report,
             "memory": heap,
         }
+        if tracer is not None:
+            out["trace"] = self.trace_summary(trace_id)
         return out
 
     def record_run(self, pid, vid, source, options=None):
@@ -309,6 +331,10 @@ class Service:
             "error": out.get("error"),
             "profiled": bool(out.get("profile")),
         }
+        # 若开启了轨迹录制，运行记录里带上轨迹 id，口径与 profile 一致
+        if isinstance(out.get("trace"), dict):
+            rec["trace_id"] = out["trace"].get("id")
+            rec["trace_event_count"] = out["trace"].get("event_count", 0)
         if pid and vid:
             vdir = storage.version_dir(pid, vid)
             run_path = os.path.join(vdir, "run.json")
@@ -370,6 +396,142 @@ class Service:
         if not sess or not sess.vm:
             return None
         return sess.vm.heap.snapshot(sess.vm.frame_snapshot())
+
+    # ==================================================================
+    # 执行轨迹
+    # ==================================================================
+    def _trace_path(self, tid):
+        return os.path.join(config.TRACES_DIR, tid + ".json")
+
+    def _trace_events_path(self, tid):
+        return os.path.join(config.TRACES_DIR, tid + ".events.json")
+
+    def _persist_trace(self, source, options, source_lines, vm, tracer):
+        """录制结束：轨迹摘要 / 事件分文件落盘并驻留内存，返回轨迹 id。
+
+        摘要（不含事件）单独存一份，使"最近轨迹"列表无需解析可达数 MB 的
+        事件数组；事件写在 .events.json，仅在打开该轨迹时读取。
+        """
+        tid = storage.new_id("trace")
+        summary = {
+            "id": tid,
+            "timestamp": storage.now_iso(),
+            "source": source,
+            "source_lines": source_lines,
+            "inputs": list(vm.input_queue),
+            "granularity": tracer.granularity,
+            "max_events": tracer.max_events,
+            "truncated": tracer.truncated,
+            "finished": vm.finished,
+            "event_count": len(tracer.events),
+            "type_counts": tracer.type_counts(),
+            "instruction_count": vm.instruction_count,
+            "elapsed_ms": round(vm.elapsed_ms(), 3),
+            "output": list(vm.output),
+            "return_value": _serialize_plain(vm.return_value),
+            "error": vm.error.to_dict() if vm.error else None,
+        }
+        sess = TraceSession(tid, dict(summary, events=tracer.events),
+                            checkpoints=tracer.checkpoints)
+        self.trace_sessions[tid] = sess
+        storage.write_json(self._trace_path(tid), summary)
+        storage.write_json(self._trace_events_path(tid), tracer.events)
+        self._prune_trace_files()
+        return tid
+
+    def _prune_trace_files(self):
+        """只保留最近的若干条轨迹（摘要与事件文件成对清理）。"""
+        try:
+            files = [f for f in os.listdir(config.TRACES_DIR)
+                     if f.startswith("trace-") and f.endswith(".json")
+                     and not f.endswith(".events.json")]
+        except OSError:
+            return
+        if len(files) <= config.TRACE_KEEP_FILES:
+            return
+        full = [os.path.join(config.TRACES_DIR, f) for f in files]
+        full.sort(key=lambda p, st=os.stat: st(p).st_mtime, reverse=True)
+        for old in full[config.TRACE_KEEP_FILES:]:
+            tid = os.path.basename(old)[:-5]
+            for p in (old, self._trace_events_path(tid)):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+    def trace_start(self, source, options=None):
+        """运行并录制轨迹（/api/trace/start）：返回摘要 + 全部事件 + 源码。"""
+        options = dict(options or {})
+        options["trace"] = True
+        out = self.run(source, options)
+        if not out.get("ok"):
+            return out
+        return out["trace"]
+
+    def _load_trace(self, tid):
+        sess = self.trace_sessions.get(tid)
+        if sess is not None:
+            return sess
+        summary = storage.read_json(self._trace_path(tid))
+        if not summary:
+            return None
+        # 事件按需从独立文件读取（列表接口不触发）
+        events = storage.read_json(self._trace_events_path(tid), [])
+        sess = TraceSession(tid, dict(summary, events=events))
+        self.trace_sessions[tid] = sess
+        return sess
+
+    def trace_summary(self, tid):
+        sess = self._load_trace(tid)
+        if not sess:
+            return None
+        return sess.summary(include_events=True)
+
+    def trace_state_at(self, tid, seq):
+        """回放轨迹到第 seq 步，返回当时的执行位置 / 变量 / 调用栈。"""
+        sess = self._load_trace(tid)
+        if not sess:
+            return None
+        return sess.state_at(seq)
+
+    def trace_delete(self, tid):
+        self.trace_sessions.pop(tid, None)
+        for path in (self._trace_path(tid), self._trace_events_path(tid)):
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        return True
+
+    def trace_list(self):
+        out = []
+        seen = set()
+        for tid, sess in self.trace_sessions.items():
+            out.append(sess.summary(include_events=False))
+            seen.add(tid)
+        if os.path.isdir(config.TRACES_DIR):
+            for f in os.listdir(config.TRACES_DIR):
+                # 摘要文件：trace-*.json（排除事件文件 .events.json）
+                if not (f.startswith("trace-") and f.endswith(".json")
+                        and not f.endswith(".events.json")):
+                    continue
+                tid = f[:-5]
+                if tid in seen:
+                    continue
+                summ = storage.read_json(os.path.join(config.TRACES_DIR, f))
+                if summ:
+                    # 只放精简视图：不解析可能很大的事件文件
+                    out.append(TraceSession(tid, summ).summary(include_events=False))
+        out.sort(key=lambda s: s.get("timestamp", ""), reverse=True)
+        return out
+
+
+def _serialize_plain(v):
+    from . import runtime as rt
+    if v is None:
+        return None
+    return rt.serialize_value(v)
 
 
 class DebugSession:
@@ -454,3 +616,126 @@ class DebugSession:
     def step_out(self):
         if self.debugger:
             self.debugger.step_out()
+
+
+class TraceSession:
+    """一次执行轨迹：事件流（持久化）+ 稀疏检查点（仅内存，按需重建）。
+
+    查看任意一步时，从最近检查点恢复一个新 VM，以 replay 模式确定性重放到目标
+    步骤；重放途中 time/random 注入录制值，input 走录制时的输入队列。
+    """
+
+    def __init__(self, tid, data, checkpoints=None):
+        self.id = tid
+        self.data = data
+        self.events = data.get("events", [])
+        # seq -> 深克隆状态；只在内存，重启后按需重放重建
+        self.checkpoints: Dict[int, dict] = checkpoints or {}
+
+    def summary(self, include_events=True):
+        d = {k: v for k, v in self.data.items() if k != "events"}
+        d["id"] = self.id
+        if include_events:
+            d["events"] = self.events
+        return d
+
+    def state_at(self, seq):
+        seq = max(-1, min(int(seq), len(self.events) - 1))
+        cp_seq, cp = self._nearest_checkpoint(seq)
+        # 初始状态（程序入口，任何指令执行前）
+        if seq < 0:
+            vm = self._fresh_vm()
+            vm.start()
+            tracer_mod.restore_state(vm, cp)
+            return tracer_mod.snapshot_at(vm, None, -1)
+
+        ev = self.events[seq]
+        vm = self._fresh_vm()
+        vm.start()
+        tracer_mod.restore_state(vm, cp)
+        # 检查点捕获在干净的指令边界，帧状态就在克隆里；行去重状态从事件流重建。
+        tr = tracer_mod.Tracer(
+            mode="replay",
+            granularity=self.data.get("granularity", "line"),
+            stop_seq=seq,
+            builtin_replays=self._nondeterministic_map())
+        # 复用检查点存储，首次深回放后后续查看即变快
+        tr.checkpoints = self.checkpoints
+        self._cp_obj_count_sync()
+        tr._cp_obj_count = dict(self._cp_obj_count)
+        vm.tracer = tr
+        tr.seq = cp_seq
+        line_keys, last_off = self._dedup_state_at(cp_seq) if cp_seq >= 0 else ({}, {})
+        tr._line_keys = line_keys
+        tr._last_off = last_off
+        vm.paused = False
+        vm.pause_reason = None
+        # 目标恰为检查点自身时不再续跑；否则由 TraceStop 在目标事件处中止
+        vm.run(pause_fn=tr.should_pause)
+        return tracer_mod.snapshot_at(vm, ev, seq)
+
+    def _nondeterministic_map(self):
+        """从事件流提取 time/random 录制值（调用序数 -> 原始值）。"""
+        out = {}
+        for ev in self.events:
+            if (len(ev) > tracer_mod.I_NONDET
+                    and ev[tracer_mod.I_TYPE] == tracer_mod.EV_CALL
+                    and ev[tracer_mod.I_KIND] == "builtin"
+                    and ev[tracer_mod.I_CALLEE] in ("time", "random")
+                    and ev[tracer_mod.I_NONDET] is not None
+                    and ev[tracer_mod.I_RESULT] is not None):
+                out[ev[tracer_mod.I_NONDET]] = tracer_mod.deserialize_primitive(
+                    ev[tracer_mod.I_RESULT])
+        return out
+
+    def _nearest_checkpoint(self, seq):
+        """返回 <= seq 的最近检查点；没有则从程序入口（seq=-1）重放。"""
+        if -1 not in self.checkpoints:
+            vm0 = self._fresh_vm()
+            vm0.start()
+            self.checkpoints[-1] = tracer_mod.capture_state(vm0)
+            self._cp_obj_count_sync()
+        avail = [s for s in self.checkpoints if s <= seq]
+        s = max(avail)
+        return s, self.checkpoints[s]
+
+    def _cp_obj_count_sync(self):
+        self._cp_obj_count = {s: len(st.get("objects", {}))
+                              for s, st in self.checkpoints.items()}
+
+    def _dedup_state_at(self, cp_seq):
+        """从事件流重建检查点边界（事件 cp_seq 已完成）处的行去重状态。
+
+        完整模拟 tracer.on_instruction 的转移：line/insn 事件更新行键，
+        相邻指令偏移回退视作循环回边并清键；enter/return 维护帧深度。
+        """
+        line_keys, last_off = {}, {}
+        prev_off = {}       # depth -> (func, offset)
+        for ev in self.events[:cp_seq + 1]:
+            t = ev[tracer_mod.I_TYPE]
+            depth, func, line = (ev[tracer_mod.I_DEPTH], ev[tracer_mod.I_FUNC],
+                                 ev[tracer_mod.I_LINE])
+            if t == tracer_mod.EV_RETURN:
+                line_keys.pop(depth, None)
+                last_off.pop(depth, None)
+                prev_off.pop(depth, None)
+                continue
+            if t not in (tracer_mod.EV_LINE, tracer_mod.EV_INSN):
+                continue
+            off = ev[tracer_mod.I_OFF]
+            po = prev_off.get(depth)
+            if po is not None and po[0] == func and off < po[1]:
+                line_keys.pop(depth, None)
+            prev_off[depth] = (func, off)
+            last_off[depth] = (func, off)
+            line_keys[depth] = (func, line)
+        return line_keys, last_off
+
+    def _fresh_vm(self):
+        result = compiler_mod.compile_source(self.data["source"])
+        if not result.success:
+            raise ValueError("轨迹源码无法重新编译")
+        vm = vm_mod.VM(result.bytecode, result.source_lines)
+        if self.data.get("inputs"):
+            vm.input_queue = list(self.data["inputs"])
+        return vm

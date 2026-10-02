@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>执行轨迹回放 · MiniLang 平台</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar"></aside>
+  <main class="main">
+    <header class="topbar" id="topbar"></header>
+    <div class="content">
+      <div class="flex wrap between mb">
+        <div class="flex wrap" style="gap:8px">
+          <select id="sample"></select>
+          <button class="btn sm" id="btn-loadproj">📂 载入项目源码</button>
+          <select id="granularity" title="录制粒度">
+            <option value="line">行级粒度（等同单步进入）</option>
+            <option value="instruction">指令级粒度（最细）</option>
+          </select>
+          <select id="recent" title="最近录制的轨迹">
+            <option value="">— 最近轨迹 —</option>
+          </select>
+        </div>
+        <button class="btn primary" id="btn-record">🎞️ 运行并录制轨迹</button>
+      </div>
+
+      <div class="muted mb" style="font-size:12.5px">
+        💡 运行后逐步回放：左侧步进列表记录每一步执行到哪行、调用了什么、进入/返回哪个函数；
+        点击任意一步即可查看当时的执行位置、变量与调用栈。循环 / 递归产生的海量步骤按上限截断，列表虚拟渲染不会压垮页面。
+      </div>
+
+      <div id="editor"></div>
+
+      <div id="summary" class="flex wrap mt" style="gap:8px;min-height:26px"></div>
+
+      <div class="trace-layout mt">
+        <!-- 左：步进列表 -->
+        <div class="card trace-panel">
+          <div class="flex between" style="margin-bottom:8px">
+            <h2 style="margin:0">🎬 步进列表</h2>
+            <span id="step-pos" class="muted mono" style="font-size:12px"></span>
+          </div>
+          <div class="flex wrap" style="gap:6px;margin-bottom:8px">
+            <input type="text" id="filter-text" placeholder="筛选函数名 / 行内容…" style="flex:1;min-width:120px;padding:4px 8px;font-size:12px">
+            <label class="flex" style="gap:3px;font-size:11.5px;color:var(--text-muted)">
+              <input type="checkbox" id="fold-repeats"> 折叠连续重复
+            </label>
+          </div>
+          <div class="flex wrap" style="gap:4px;margin-bottom:8px" id="type-filters"></div>
+          <div id="step-list" class="step-list" tabindex="0"></div>
+          <div class="flex wrap between" style="gap:6px;margin-top:8px;align-items:center">
+            <div class="flex" style="gap:4px">
+              <button class="btn sm" id="btn-first" title="第一步">⏮</button>
+              <button class="btn sm" id="btn-prev" title="上一步 (↑)">◀</button>
+              <button class="btn sm primary" id="btn-play" title="自动播放">▶</button>
+              <button class="btn sm" id="btn-next" title="下一步 (↓)">▶</button>
+              <button class="btn sm" id="btn-last" title="最后一步">⏭</button>
+            </div>
+            <div class="flex" style="gap:4px;font-size:11.5px;color:var(--text-muted)">
+              速度
+              <select id="play-speed" style="padding:2px 4px;font-size:12px">
+                <option value="600">慢</option>
+                <option value="220" selected>正常</option>
+                <option value="80">快</option>
+                <option value="20">极快</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <!-- 右：详情 -->
+        <div class="trace-detail">
+          <div class="card">
+            <h2 id="detail-title">📍 执行位置</h2>
+            <div id="detail-event" class="mono" style="font-size:12.5px"></div>
+            <div id="trace-source" class="trace-source"></div>
+          </div>
+          <div class="card">
+            <h2>📚 调用栈与变量</h2>
+            <h3>调用栈</h3>
+            <div id="d-callstack"></div>
+            <h3>局部变量（当前帧）</h3>
+            <div id="d-locals"></div>
+            <h3>全局变量</h3>
+            <div id="d-globals"></div>
+          </div>
+          <div class="card">
+            <h2>🔎 步骤详情</h2>
+            <div id="d-payload"></div>
+            <h3>操作数栈（栈顶）</h3>
+            <div id="d-operand"></div>
+            <h3>输出（截至该步）</h3>
+            <div class="output-console" id="d-output" style="min-height:48px;max-height:140px"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/editor.js"></script>
+<script src="js/trace.js"></script>
+</body>
+</html>

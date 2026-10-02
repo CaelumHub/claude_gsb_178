@@ -16,7 +16,7 @@ import os
 import re
 import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 from . import config
 from . import service as service_mod
@@ -55,6 +55,10 @@ def _read_body(handler) -> dict:
         return json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return {}
+
+
+def _parse_query(q) -> dict:
+    return {k: v[-1] for k, v in parse_qs(q).items()}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -157,6 +161,43 @@ class Handler(BaseHTTPRequestHandler):
                 opts["sample_interval_ms"] = int(opts["sample_interval_ms"])
             out = svc.run(body.get("source", ""), opts)
             return self._json(200, {"ok": True, "result": out})
+
+        # ---- 执行轨迹回放 ----
+        if path == "/api/trace/start" and method == "POST":
+            opts = body.get("options", {})
+            if not isinstance(opts, dict):
+                opts = {}
+            out = svc.run(body.get("source", ""),
+                          dict(opts, trace=True))
+            if not out.get("ok"):
+                return self._json(200, {
+                    "ok": False,
+                    "diagnostics": out.get("diagnostics", []),
+                    "stage": out.get("stage"),
+                })
+            return self._json(200, {"ok": True, "trace": out.get("trace")})
+        if path == "/api/trace" and method == "GET":
+            return self._json(200, {"ok": True, "traces": svc.trace_list()})
+
+        m = re.match(r"^/api/trace/([^/]+)/state$", path)
+        if m and method == "GET":
+            qs = _parse_query(query)
+            try:
+                seq = int(qs.get("seq", "-1"))
+            except ValueError:
+                seq = -1
+            state = svc.trace_state_at(m.group(1), seq)
+            if state is None:
+                return self._json(404, {"ok": False, "error": "轨迹不存在或已过期"})
+            state["ok"] = True
+            return self._json(200, state)
+        m = re.match(r"^/api/trace/([^/]+)$", path)
+        if m and method == "GET":
+            trace = svc.trace_summary(m.group(1))
+            return self._json(200, {"ok": bool(trace), "trace": trace})
+        if m and method == "DELETE":
+            svc.trace_delete(m.group(1))
+            return self._json(200, {"ok": True})
 
         # ---- 调试 ----
         if path == "/api/debug/start" and method == "POST":

@@ -21,6 +21,7 @@ FRONTEND_DIR = os.path.join(BASE_DIR, "frontend")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 PROJECTS_DIR = os.path.join(DATA_DIR, "projects")
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
+TRACES_DIR = os.path.join(DATA_DIR, "traces")
 SETTINGS_DIR = os.path.join(DATA_DIR, "settings")
 
 # 语言与平台元信息
@@ -43,10 +44,15 @@ MAX_LIST_LEN = 1_000_000                # 列表最大长度
 MAX_SAMPLE_INTERVAL_MS = 1000           # 采样剖析最大间隔（毫秒）
 MIN_SAMPLE_INTERVAL_MS = 1              # 采样剖析最小间隔（毫秒）
 
+# 执行轨迹：默认 / 硬上限事件数，保留的最近轨迹文件数
+TRACE_MAX_EVENTS = 50_000
+TRACE_MAX_EVENTS_HARD = 200_000
+TRACE_KEEP_FILES = 30
+
 
 def ensure_dirs():
     """确保运行所需的目录都存在（幂等）。"""
-    for d in (DATA_DIR, PROJECTS_DIR, RUNS_DIR, SETTINGS_DIR):
+    for d in (DATA_DIR, PROJECTS_DIR, RUNS_DIR, TRACES_DIR, SETTINGS_DIR):
         os.makedirs(d, exist_ok=True)
 
 

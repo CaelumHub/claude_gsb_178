@@ -1,0 +1,36 @@
+{
+  "elapsed_ms": 7.091,
+  "error": null,
+  "event_count": 889,
+  "finished": true,
+  "granularity": "line",
+  "id": "trace-485db06199aa",
+  "inputs": [],
+  "instruction_count": 1949,
+  "max_events": 50000,
+  "output": [
+    "55"
+  ],
+  "return_value": null,
+  "source": "// 递归计算斐波那契数列\nfunc fib(n) {\n    if (n < 2) {\n        return n;\n    }\n    return fib(n - 1) + fib(n - 2);\n}\nprint(fib(10));",
+  "source_lines": [
+    "// 递归计算斐波那契数列",
+    "func fib(n) {",
+    "    if (n < 2) {",
+    "        return n;",
+    "    }",
+    "    return fib(n - 1) + fib(n - 2);",
+    "}",
+    "print(fib(10));"
+  ],
+  "timestamp": "10:34:18",
+  "truncated": false,
+  "type_counts": {
+    "call": 178,
+    "enter": 177,
+    "error": 0,
+    "insn": 0,
+    "line": 356,
+    "return": 178
+  }
+}

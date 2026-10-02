@@ -18,6 +18,7 @@
     { key: "symbols",     href: "symbols.html",     icon: "🏷️", title: "符号表与作用域",  group: "编译前端" },
     { key: "bytecode",    href: "bytecode.html",    icon: "🧩", title: "字节码 / 中间代码", group: "编译前端" },
     { key: "debug",       href: "debug.html",       icon: "🐞", title: "执行跟踪与单步调试", group: "运行调试" },
+    { key: "trace",       href: "trace.html",       icon: "🎞️", title: "执行轨迹回放",      group: "运行调试" },
     { key: "callstack",   href: "callstack.html",   icon: "📚", title: "调用栈与变量监视", group: "运行调试" },
     { key: "memory",      href: "memory.html",      icon: "🧠", title: "内存模型可视化",  group: "运行调试" },
     { key: "diagnostics", href: "diagnostics.html", icon: "🩺", title: "错误诊断与修复",  group: "分析与优化" },
@@ -142,6 +143,13 @@
     // ---- 编译 / 运行 ----
     compile(source, detail) { return this.post("/api/compile", { source, detail: detail || "all" }); },
     run(source, options) { return this.post("/api/run", { source, options: options || {} }); },
+
+    // ---- 执行轨迹 ----
+    traceStart(source, options) { return this.post("/api/trace/start", { source, options: options || {} }); },
+    traceList() { return this.get("/api/trace"); },
+    traceGet(id) { return this.get(`/api/trace/${id}`); },
+    traceState(id, seq) { return this.get(`/api/trace/${id}/state?seq=${seq}`); },
+    traceDelete(id) { return this.del(`/api/trace/${id}`); },
 
     // ---- 调试 ----
     debugStart(source, breakpoints, pid, vid) { return this.post("/api/debug/start", { source, breakpoints: breakpoints || [], project_id: pid, version_id: vid }); },
